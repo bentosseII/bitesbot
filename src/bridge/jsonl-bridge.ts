@@ -1,0 +1,2380 @@
+import WebSocket from 'ws'
+import type { GatewayEvent, IncomingMessage, OutboundMessage, SendResponse } from '../protocol/types.js'
+import { readFile, stat } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { type CLIManifest, loadAllManifests } from './manifest.js'
+import {
+	JsonlSession,
+	createSessionStore,
+	type SessionStore,
+	type BridgeEvent,
+	type ToolExecutor,
+} from './jsonl-session.js'
+import { createPersistentSessionStore, type PersistentSessionStore } from './session-store.js'
+import { syncSessionToMemory } from './memory-sync.js'
+import { maybeAutoFlushSessionToMemory } from './auto-memory-flush.js'
+import { CronService, parseScheduleArg } from '../cron/index.js'
+import type { CronJob, CronOutputExpectation } from '../cron/types.js'
+import { logToFile, log, logError, logWarn } from '../logging/file.js'
+import {
+	subagentRegistry,
+	saveSubagentRegistry,
+	loadSubagentRegistry,
+	formatPendingResultsForInjection,
+	type SubagentRunRecord,
+} from './subagent-registry.js'
+import {
+	CommandLane,
+	enqueueCommandInLane,
+	initDefaultLanes,
+} from './command-queue.js'
+import {
+	parseSpawnCommand,
+	parseNaturalSpawnRequest,
+	parseSubagentsCommand,
+	formatSubagentList,
+	formatSubagentAnnouncement,
+	parseAssistantSpawnCommand,
+	findSubagent,
+} from './subagent-commands.js'
+import { buildMemoryRecall } from '../memory/recall.js'
+import type { MemoryConfig } from '../memory/types.js'
+import {
+	buildMemoryToolInstructions,
+	buildRecallEnforcementHint,
+	formatMemoryToolResultPrompt,
+	parseMemoryToolCall,
+	runMemoryTool,
+	type MemoryToolCall,
+} from '../memory/tools.js'
+import {
+	buildSessionToolInstructions,
+	formatSessionToolResultPrompt,
+	parseSessionToolCall,
+	runSessionTool,
+	type SessionToolCall,
+} from './session-tools.js'
+import { createConceptsIndex, getRelatedFilesForTerms } from '../workspace/concepts-index.js'
+import { spawn } from 'node:child_process'
+import {
+	extractConceptsFromText,
+	getRepoNames,
+	loadConceptConfig,
+	normalizeConcept,
+	normalizeConceptConfig,
+	normalizeConceptToken,
+	saveConceptConfig,
+} from '../workspace/concepts.js'
+import { getRelativePath } from '../workspace/path-utils.js'
+import { buildBootContext } from '../workspace/boot-context.js'
+import type { Skill } from '../skills/index.js'
+import { normalizeBridgeEvents } from './normalize.js'
+import { extractSendfileCommands, stripSendfileCommands, type SendfileCommand } from './sendfile.js'
+
+export type BridgeConfig = {
+	gatewayUrl: string
+	authToken?: string
+	adaptersDir: string
+	defaultCli: string
+	subagentFallbackCli?: string
+	workingDirectory: string
+	allowedChatIds?: number[]
+	memory?: MemoryConfig
+	envFile?: string
+	normalizedOutput?: boolean
+}
+
+export type BridgeHandle = {
+	close: () => void
+	getManifests: () => Map<string, CLIManifest>
+	getSessionStore: () => SessionStore
+}
+
+type CommandResult =
+	| { handled: false }
+	| { handled: true; response: string }
+	| { handled: true; response: string; async: true }
+
+type ParseCommandOptions = {
+	text: string
+	chatId: number | string
+	manifests: Map<string, CLIManifest>
+	defaultCli: string
+	sessionStore: SessionStore
+	workingDirectory: string
+	cronService?: CronService
+	persistentStore?: PersistentSessionStore
+	skills?: Map<string, Skill>
+	reloadSkills?: () => Promise<Map<string, Skill>>
+}
+
+const parseSlashCommand = (text: string): { command: string; rest: string } | null => {
+	const trimmed = text.trim()
+	if (!trimmed.startsWith('/')) return null
+	const match = trimmed.match(/^\/(\S+)(?:\s+([\s\S]*))?$/)
+	if (!match) return null
+	const token = match[1] ?? ''
+	if (!token) return null
+	const command = token.split('@')[0]?.toLowerCase()
+	if (!command) return null
+	return { command, rest: match[2]?.trim() ?? '' }
+}
+
+const UPDATE_LOCK_TTL_MS = 10 * 60 * 1000
+let updateLockAt: number | null = null
+
+const isUpdateLocked = (): boolean =>
+	updateLockAt !== null && Date.now() - updateLockAt < UPDATE_LOCK_TTL_MS
+
+const acquireUpdateLock = () => {
+	updateLockAt = Date.now()
+}
+
+const releaseUpdateLock = () => {
+	updateLockAt = null
+}
+
+const isLaunchdEnv = (): boolean => {
+	const flag = process.env.TG_GATEWAY_LAUNCHD?.toLowerCase()
+	if (flag && ['1', 'true', 'yes'].includes(flag)) return true
+	return Boolean(process.env.TG_GATEWAY_LAUNCHD_LABEL || process.env.TG_GATEWAY_LAUNCHD_PLIST)
+}
+
+const resolveRepoRoot = (): string => {
+	const override = process.env.TG_GATEWAY_REPO_DIR
+	if (override) return override
+	const currentDir = dirname(fileURLToPath(import.meta.url))
+	return resolve(currentDir, '..', '..')
+}
+
+const spawnDetached = (command: string, args: string[], cwd: string) => {
+	const child = spawn(command, args, {
+		cwd,
+		detached: true,
+		stdio: 'ignore',
+		env: process.env,
+	})
+	child.on('error', (err) => {
+		logError(`[jsonl-bridge] Failed to spawn ${command}:`, err)
+	})
+	child.unref()
+}
+
+const MODEL_ALIASES: Record<string, string> = {
+	// Claude models
+	opus: 'claude-opus-4-5-20251101',
+	sonnet: 'claude-sonnet-4-5-20250929',
+	haiku: 'claude-haiku-4-5-20251001',
+	// OpenAI Codex models
+	codex: 'gpt-5.2-codex',
+	'codex-max': 'gpt-5.1-codex-max',
+	// Gemini
+	gemini: 'gemini-3-pro-preview',
+	'gemini-flash': 'gemini-3-flash-preview',
+}
+
+const resolveModelAlias = (model?: string): string | undefined => {
+	if (!model) return undefined
+	const normalized = model.toLowerCase()
+	return MODEL_ALIASES[normalized] ?? model
+}
+
+const resolveModelForCli = (cli: string, model?: string): string | undefined => {
+	const resolved = resolveModelAlias(model)
+	if (!resolved) return undefined
+	const normalized = resolved.toLowerCase()
+
+	if (cli === 'codex') {
+		if (normalized.includes('claude') || normalized.includes('gemini')) return undefined
+		return resolved
+	}
+
+	if (cli === 'claude') {
+		return normalized.includes('claude') ? resolved : undefined
+	}
+
+	if (cli === 'droid') {
+		if (normalized.includes('claude') || normalized.includes('codex')) return resolved
+		return undefined
+	}
+
+	if (cli.startsWith('gemini')) {
+		return normalized.includes('gemini') ? resolved : undefined
+	}
+
+	return resolved
+}
+
+// Check if text is just a bare URL (for quick link saving)
+const isBareUrl = (text: string): boolean => {
+	const trimmed = text.trim()
+	// Must start with http:// or https:// and have no other content
+	if (!trimmed.match(/^https?:\/\/\S+$/)) return false
+	// Reject if it has spaces (meaning additional text)
+	if (trimmed.includes(' ')) return false
+	return true
+}
+
+const parseCommand = async (opts: ParseCommandOptions): Promise<CommandResult> => {
+	const { text, chatId, manifests, defaultCli, sessionStore, workingDirectory, cronService, persistentStore } = opts
+	const trimmed = text.trim()
+
+	// Quick link save: if message is just a URL, append to links/inbox.md
+	if (isBareUrl(trimmed)) {
+		try {
+			const { appendFile, mkdir } = await import('node:fs/promises')
+			const { join } = await import('node:path')
+			const linksDir = join(workingDirectory, 'links')
+			const inboxPath = join(linksDir, 'inbox.md')
+			await mkdir(linksDir, { recursive: true })
+			const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 16)
+			const entry = `- ${trimmed} (${timestamp})\n`
+			await appendFile(inboxPath, entry, 'utf-8')
+			console.log(`[jsonl-bridge] Saved link to inbox: ${trimmed}`)
+			return { handled: true, response: '📎 Saved' }
+		} catch (err) {
+			console.error('[jsonl-bridge] Failed to save link:', err)
+			// Fall through to normal processing if save fails
+		}
+	}
+
+	if (trimmed.startsWith('/use ')) {
+		const cli = trimmed.slice(5).trim().toLowerCase()
+		const manifest = manifests.get(cli)
+		if (!manifest) {
+			const available = Array.from(manifests.keys()).join(', ')
+			return { handled: true, response: `Unknown CLI: ${cli}. Available: ${available}` }
+		}
+		// Set active CLI directly instead of pending switch
+		sessionStore.setActiveCli(chatId, cli)
+		if (persistentStore) {
+			await persistentStore.setActiveCli(chatId, cli)
+		}
+		return { handled: true, response: `Switched to ${cli}.` }
+	}
+
+	// /models command - list model aliases
+	if (trimmed === '/models') {
+		const current = persistentStore?.getChatSettings(chatId).model ?? 'default'
+		const lines = [
+			`Current model: ${current}`,
+			'Aliases:',
+			...Object.entries(MODEL_ALIASES).map(([alias, id]) => `- ${alias}: ${id}`),
+		]
+		return { handled: true, response: lines.join('\n') }
+	}
+
+	if (trimmed === '/help') {
+		const lines = [
+			'Available Commands:',
+			'/use <cli> - switch adapter',
+			'/new - start a fresh session',
+			'/status - show session status',
+			'/model <alias|id> - set model for next session',
+			'/models - list available model aliases',
+			'/stream on|off - toggle streaming responses',
+			'/spawn <task> - run a subagent task',
+			'/subagents - list subagent runs',
+			'/cron <expr> <message> - schedule a cron job',
+			'/crons - list cron jobs',
+			'/remind <time> <message> - schedule a reminder',
+			'/prebrief [event] - generate meeting pre-brief',
+			'/stop - terminate the current session',
+			'/interrupt - stop current task and continue queue',
+			'/restart - restart the gateway',
+			'/update - build + restart the gateway',
+		]
+		return { handled: true, response: lines.join('\n') }
+	}
+
+	// /model command - switch AI model (with aliases)
+	if (trimmed.startsWith('/model')) {
+		const arg = trimmed.slice(6).trim().toLowerCase()
+		if (!arg) {
+			return { handled: true, response: 'Usage: /model <alias>\nAliases: opus, sonnet, haiku, codex\nFull IDs also supported (e.g., claude-opus-4-5-20251101)' }
+		}
+		const modelId = resolveModelAlias(arg) ?? arg
+		// Store model preference (will be passed to CLI on next session)
+		// Note: setChatSettings merges with existing settings, so this won't clobber streaming/verbose
+		if (persistentStore) {
+			await persistentStore.setChatSettings(chatId, { model: modelId })
+		}
+		return { handled: true, response: `Model set to: ${modelId}\nWill apply to next message (start /new session for fresh context).` }
+	}
+
+	if (trimmed === '/new') {
+		const session = sessionStore.get(chatId)
+		const currentCli = sessionStore.getActiveCli(chatId) || session?.cli || defaultCli
+
+		// Sync session to memory before clearing
+		try {
+			const result = await syncSessionToMemory(workingDirectory)
+			if (result.written) {
+				log(`[jsonl-bridge] Synced ${result.entries} messages to memory`)
+			}
+		} catch (err) {
+			logError('[jsonl-bridge] Failed to sync memory on /new:', err)
+		}
+		
+		sessionStore.clearResumeToken(chatId, currentCli)
+		if (persistentStore) {
+			await persistentStore.clearResumeToken(chatId, currentCli)
+		}
+		
+		if (session) {
+			session.terminate()
+			sessionStore.delete(chatId)
+		}
+		// Clear resume tokens so /new truly starts fresh
+		sessionStore.clearResumeTokens(chatId)
+		if (persistentStore) {
+			await persistentStore.clearResumeTokens(chatId)
+		}
+		return { handled: true, response: '💾 Session saved to memory. Starting fresh.' }
+	}
+
+	if (trimmed === '/stop') {
+		const session = sessionStore.get(chatId)
+		const stoppedSubagents = subagentRegistry.stopAll(chatId)
+		if (session) {
+			session.terminate()
+			sessionStore.delete(chatId)
+			const subagentMsg = stoppedSubagents > 0 ? ` + ${stoppedSubagents} subagent(s)` : ''
+			return { handled: true, response: `🛑 Session stopped${subagentMsg}.` }
+		}
+		if (stoppedSubagents > 0) {
+			return { handled: true, response: `🛑 Stopped ${stoppedSubagents} subagent(s).` }
+		}
+		return { handled: true, response: 'No active session to stop.' }
+	}
+
+	// /interrupt or /skip - stop current agent turn but keep queue and session
+	if (trimmed === '/interrupt' || trimmed === '/skip') {
+		const session = sessionStore.get(chatId)
+		if (!session) {
+			return { handled: true, response: 'No active task to interrupt.' }
+		}
+		// Terminate the current session but keep the queue
+		session.terminate()
+		sessionStore.delete(chatId)
+		const queueLen = sessionStore.getQueueLength(chatId)
+		const queueMsg = queueLen > 0 ? ` Processing next queued message (${queueLen} pending).` : ''
+		// Signal async handling to flush queue using structured flag
+		return { handled: true, response: `__INTERRUPT__:⏭️ Task interrupted.${queueMsg}`, async: true }
+	}
+
+	const slashCommand = parseSlashCommand(trimmed)
+	if (slashCommand?.command === 'update') {
+		log('[jsonl-bridge] Update requested via /update command')
+		if (isUpdateLocked()) {
+			const remainingMs = UPDATE_LOCK_TTL_MS - (Date.now() - (updateLockAt ?? 0))
+			const remainingMin = Math.max(1, Math.ceil(remainingMs / 60000))
+			return { handled: true, response: `⏳ Update already running. Try again in ~${remainingMin}m.` }
+		}
+		acquireUpdateLock()
+		setTimeout(() => {
+			try {
+				const script = isLaunchdEnv()
+					? 'gateway:launchd:restart:build'
+					: 'gateway:restart:build'
+				spawnDetached('pnpm', ['run', script], resolveRepoRoot())
+			} catch (err) {
+				releaseUpdateLock()
+				logError('[jsonl-bridge] Failed to spawn update process:', err)
+			}
+		}, 500)
+		return { handled: true, response: '⬆️ Updating gateway (build + restart)...' }
+	}
+
+	// /restart - gracefully restart the gateway (launchd will respawn)
+	if (slashCommand?.command === 'restart') {
+		log('[jsonl-bridge] Restart requested via /restart command')
+		if (!isLaunchdEnv()) {
+			setTimeout(() => {
+				try {
+					spawnDetached('pnpm', ['run', 'gateway:restart'], workingDirectory)
+				} catch (err) {
+					logError('[jsonl-bridge] Failed to spawn restart process:', err)
+				}
+			}, 200)
+		}
+		// Schedule exit after sending response (give time for message to be sent)
+		setTimeout(() => {
+			log('[jsonl-bridge] Exiting for restart...')
+			process.kill(process.pid, 'SIGTERM')
+		}, 500)
+		return { handled: true, response: '🔄 Restarting gateway...' }
+	}
+
+	if (trimmed === '/status') {
+		const session = sessionStore.get(chatId)
+		const currentCli = sessionStore.getActiveCli(chatId) || session?.cli || defaultCli
+		const resumeToken = sessionStore.getResumeToken(chatId, currentCli)
+		const settings = persistentStore?.getChatSettings(chatId) ?? { streaming: false, verbose: false, model: undefined }
+		const modelDisplay = settings.model ? resolveModelAlias(settings.model) || settings.model : 'default'
+		
+		// Get active subagents
+		const activeSubagents = subagentRegistry.listActive(chatId)
+		
+		if (!session && !resumeToken) {
+			const lines = [
+				`CLI: ${currentCli}`,
+				`Model: ${modelDisplay}`,
+				`Streaming: ${settings.streaming ? 'on' : 'off'}`,
+			]
+			if (activeSubagents.length > 0) {
+				lines.push('')
+				lines.push(`🔄 Subagents (${activeSubagents.length}):`)
+				for (const sub of activeSubagents) {
+					const label = sub.label || sub.runId.slice(0, 8)
+					const status = sub.status === 'running' ? '⚙️' : '⏳'
+					lines.push(`  ${status} ${label} (${sub.cli})`)
+				}
+			}
+			return { handled: true, response: lines.join('\n') }
+		}
+		const info = session?.getInfo()
+		const lines = [
+			`CLI: ${currentCli}`,
+			`Model: ${modelDisplay}`,
+			`State: ${info?.state || 'ready'}`,
+			`Streaming: ${settings.streaming ? 'on' : 'off'}`,
+		]
+		if (resumeToken) {
+			lines.push(`Resume: ${resumeToken.sessionId.slice(0, 8)}...`)
+		}
+		// Show active subagents
+		if (activeSubagents.length > 0) {
+			lines.push('')
+			lines.push(`🔄 Subagents (${activeSubagents.length}):`)
+			for (const sub of activeSubagents) {
+				const label = sub.label || sub.runId.slice(0, 8)
+				const status = sub.status === 'running' ? '⚙️' : '⏳'
+				const elapsed = sub.startedAt ? `${Math.round((Date.now() - sub.startedAt) / 1000)}s` : 'queued'
+				lines.push(`  ${status} ${label} (${sub.cli}) - ${elapsed}`)
+			}
+		}
+		return { handled: true, response: lines.join('\n') }
+	}
+
+	if (trimmed === '/stream' || trimmed === '/stream on' || trimmed === '/stream off') {
+		if (!persistentStore) {
+			return { handled: true, response: 'Settings not available.' }
+		}
+		const current = persistentStore.getChatSettings(chatId)
+		const newValue = trimmed === '/stream off' ? false : trimmed === '/stream on' ? true : !current.streaming
+		await persistentStore.setChatSettings(chatId, { streaming: newValue })
+		return { handled: true, response: `Streaming ${newValue ? 'enabled' : 'disabled'}. Text will be sent ${newValue ? 'as it arrives' : 'when complete'}.` }
+	}
+
+	// Hidden feature: /verbose - shows tool names and outputs (off by default)
+	if (trimmed === '/verbose' || trimmed === '/verbose on' || trimmed === '/verbose off') {
+		if (!persistentStore) {
+			return { handled: true, response: 'Settings not available.' }
+		}
+		const current = persistentStore.getChatSettings(chatId)
+		const newValue = trimmed === '/verbose off' ? false : trimmed === '/verbose on' ? true : !current.verbose
+		await persistentStore.setChatSettings(chatId, { verbose: newValue })
+		return { handled: true, response: `Verbose ${newValue ? 'enabled' : 'disabled'}. Tool ${newValue ? 'names and outputs will be shown' : 'details hidden'}.` }
+	}
+
+	if (trimmed.startsWith('/concepts')) {
+		const term = trimmed.replace('/concepts', '').trim()
+		if (!term) {
+			return { handled: true, response: 'Usage: /concepts <term>' }
+		}
+
+		const manager = createConceptsIndex(workingDirectory)
+		const index = await manager.loadIndex()
+		if (!index) {
+			return { handled: true, response: 'No concepts index found. Run "tg-concepts rebuild" on the server.' }
+		}
+
+		const config = await loadConceptConfig(manager.getConfigDir())
+		const normalizedConfig = normalizeConceptConfig(config)
+		const canonical = normalizeConcept(term, normalizedConfig)
+		if (!canonical) {
+			return { handled: true, response: `No concept found for "${term}".` }
+		}
+
+		const entry = index.concepts[canonical]
+		if (!entry) {
+			return { handled: true, response: `No concept found for "${canonical}".` }
+		}
+
+		const mentions = entry.mentions.slice(0, 20)
+		const remaining = entry.mentions.length - mentions.length
+		const lines = mentions.map(mention => `- ${mention.file} (${mention.count})`)
+		if (remaining > 0) {
+			lines.push(`...and ${remaining} more`)
+		}
+		return { handled: true, response: [`Files mentioning "${canonical}":`, ...lines].join('\n') }
+	}
+
+	if (trimmed.startsWith('/related')) {
+		const term = trimmed.replace('/related', '').trim()
+		if (!term) {
+			return { handled: true, response: 'Usage: /related <term>' }
+		}
+
+		const manager = createConceptsIndex(workingDirectory)
+		const index = await manager.loadIndex()
+		if (!index) {
+			return { handled: true, response: 'No concepts index found. Run "tg-concepts rebuild" on the server.' }
+		}
+
+		const config = await loadConceptConfig(manager.getConfigDir())
+		const normalizedConfig = normalizeConceptConfig(config)
+		const canonical = normalizeConcept(term, normalizedConfig)
+		if (!canonical) {
+			return { handled: true, response: `No concept found for "${term}".` }
+		}
+
+		const entry = index.concepts[canonical]
+		if (!entry) {
+			return { handled: true, response: `No concept found for "${canonical}".` }
+		}
+
+		const relatedEntries = Object.entries(entry.related).slice(0, 10)
+		const relatedLines = relatedEntries.map(([related, score]) => `- ${related} (${score})`)
+		const relatedFiles = getRelatedFilesForTerms(index, [canonical], 5)
+		const fileLines = relatedFiles.map(file => `- ${file}`)
+		const responseLines = [`Related concepts for "${canonical}":`]
+		if (relatedLines.length > 0) {
+			responseLines.push(...relatedLines)
+		} else {
+			responseLines.push('(none)')
+		}
+		if (fileLines.length > 0) {
+			responseLines.push('', 'Related files:', ...fileLines)
+		}
+		return { handled: true, response: responseLines.join('\n') }
+	}
+
+	if (trimmed.startsWith('/file')) {
+		const filePath = trimmed.replace('/file', '').trim()
+		if (!filePath) {
+			return { handled: true, response: 'Usage: /file <path>' }
+		}
+
+		const manager = createConceptsIndex(workingDirectory)
+		const index = await manager.loadIndex()
+		if (!index) {
+			return { handled: true, response: 'No concepts index found. Run "tg-concepts rebuild" on the server.' }
+		}
+
+		const relative = getRelativePath(filePath, workingDirectory)
+		const entry = index.files[relative]
+		if (!entry) {
+			return { handled: true, response: `No concepts found for "${relative}".` }
+		}
+
+		const lines = entry.concepts.map(concept => `- ${concept}`)
+		return { handled: true, response: [`Concepts in ${relative}:`, ...lines].join('\n') }
+	}
+
+	if (trimmed.startsWith('/aliases')) {
+		const args = trimmed.replace('/aliases', '').trim()
+		const manager = createConceptsIndex(workingDirectory)
+		const config = await loadConceptConfig(manager.getConfigDir())
+		const normalizedConfig = normalizeConceptConfig(config)
+
+		if (args === '' || args === 'list') {
+			const entries = Object.entries(config.aliases ?? {}).sort((a, b) => a[0].localeCompare(b[0]))
+			if (entries.length === 0) {
+				return { handled: true, response: 'No aliases configured.' }
+			}
+			const lines = entries.map(([alias, canonical]) => `- ${alias} -> ${canonical}`)
+			return { handled: true, response: ['Aliases:', ...lines].join('\n') }
+		}
+
+		const addMatch = args.match(/^add\s+(\S+)\s+(.+)$/)
+		if (addMatch) {
+			const normalizedAlias = normalizeConceptToken(addMatch[1])
+			const normalizedCanonical = normalizeConceptToken(addMatch[2])
+			if (!normalizedAlias || !normalizedCanonical) {
+				return { handled: true, response: 'Alias and canonical terms must be non-empty.' }
+			}
+			const canonical = normalizeConcept(addMatch[2], normalizedConfig) ?? normalizedCanonical
+			config.aliases = config.aliases ?? {}
+			config.aliases[normalizedAlias] = canonical
+			await saveConceptConfig(config, manager.getConfigDir())
+			return { handled: true, response: `Added alias: ${normalizedAlias} -> ${canonical}` }
+		}
+
+		const removeMatch = args.match(/^remove\s+(\S+)$/)
+		if (removeMatch) {
+			const normalizedAlias = normalizeConceptToken(removeMatch[1])
+			if (!normalizedAlias || !config.aliases || !config.aliases[normalizedAlias]) {
+				return { handled: true, response: `Alias not found: ${removeMatch[1]}` }
+			}
+			delete config.aliases[normalizedAlias]
+			await saveConceptConfig(config, manager.getConfigDir())
+			return { handled: true, response: `Removed alias: ${normalizedAlias}` }
+		}
+
+	return { handled: true, response: 'Usage: /aliases list | /aliases add <alias> <canonical> | /aliases remove <alias>' }
+	}
+
+	// Subagent commands - /spawn handled async in bridge, return signal here
+	if (trimmed.startsWith('/spawn')) {
+		const parsed = parseSpawnCommand(trimmed)
+		if (!parsed) {
+			return { handled: true, response: 'Usage: /spawn "task"\n       /spawn --label "Name" "task"\n       /spawn --cli droid "task"' }
+		}
+		// Signal that this is a spawn command - actual spawning handled in bridge
+		return { handled: true, response: '__SPAWN__', async: true }
+	}
+
+	// /subagents command
+	if (trimmed.startsWith('/subagents')) {
+		const parsed = parseSubagentsCommand(trimmed)
+		if (!parsed) {
+			return { handled: true, response: 'Usage:\n/subagents\n/subagents list\n/subagents stop <id>\n/subagents stop all\n/subagents log <id>' }
+		}
+
+		switch (parsed.action) {
+			case 'list': {
+				const records = subagentRegistry.list(chatId)
+				return { handled: true, response: formatSubagentList(records) }
+			}
+			case 'stop-all': {
+				const count = subagentRegistry.stopAll(chatId)
+				return { handled: true, response: count > 0 ? `🛑 Stopped ${count} subagent(s).` : 'No active subagents.' }
+			}
+			case 'stop': {
+				const record = findSubagent(chatId, parsed.target)
+				if (!record) {
+					return { handled: true, response: `Subagent not found: ${parsed.target}` }
+				}
+				subagentRegistry.stop(record.runId)
+				return { handled: true, response: `🛑 Stopped: ${record.label || record.runId.slice(0, 8)}` }
+			}
+			case 'log': {
+				const record = findSubagent(chatId, parsed.target)
+				if (!record) {
+					return { handled: true, response: `Subagent not found: ${parsed.target}` }
+				}
+				const output = record.result || record.error || '(no output yet)'
+				return { handled: true, response: `📋 ${record.label || record.runId.slice(0, 8)}:\n\n${output}` }
+			}
+		}
+	}
+
+	// Cron commands
+	if (cronService && trimmed.startsWith('/cron')) {
+		const args = trimmed.slice(5).trim()
+
+		if (args === '' || args === 'list') {
+			const jobs = await cronService.list()
+			return { handled: true, response: cronService.formatJobList(jobs) }
+		}
+
+		// /cron add "name" every 30m
+		// /cron add "name" cron "0 9 * * *"
+		const addMatch = args.match(/^add\s+"([^"]+)"\s+(.+)$/i)
+		if (addMatch) {
+			const [, name, scheduleArg] = addMatch
+			const schedule = parseScheduleArg(scheduleArg)
+			if (!schedule) {
+				return { handled: true, response: `Invalid schedule: ${scheduleArg}\nExamples: every 30m, every 1h, cron "0 9 * * *"` }
+			}
+			const job = await cronService.add({ name, schedule })
+			return { handled: true, response: `Created job: ${job.id}\n${name}\nNext run: ${job.nextRunAtMs ? new Date(job.nextRunAtMs).toLocaleString() : 'n/a'}` }
+		}
+
+		// /cron remove <id>
+		const removeMatch = args.match(/^remove\s+(\S+)$/i)
+		if (removeMatch) {
+			const removed = await cronService.remove(removeMatch[1])
+			return { handled: true, response: removed ? `Removed job: ${removeMatch[1]}` : `Job not found: ${removeMatch[1]}` }
+		}
+
+		// /cron run <id>
+		const runMatch = args.match(/^run\s+(\S+)$/i)
+		if (runMatch) {
+			const job = await cronService.run(runMatch[1])
+			return { handled: true, response: job ? `Running job: ${job.name}` : `Job not found: ${runMatch[1]}` }
+		}
+
+		// /cron enable/disable <id>
+		const enableMatch = args.match(/^(enable|disable)\s+(\S+)$/i)
+		if (enableMatch) {
+			const [, action, id] = enableMatch
+			const enabled = action.toLowerCase() === 'enable'
+			const success = await cronService.enable(id, enabled)
+			return { handled: true, response: success ? `Job ${id} ${enabled ? 'enabled' : 'disabled'}` : `Job not found: ${id}` }
+		}
+
+		return { handled: true, response: `Unknown cron command. Usage:\n/cron list\n/cron add "name" every 30m\n/cron add "name" cron "0 9 * * *"\n/cron remove <id>\n/cron run <id>\n/cron enable <id>\n/cron disable <id>` }
+	}
+
+	// /prebrief command - generate meeting pre-briefs
+	if (trimmed.startsWith('/prebrief')) {
+		const { createPrebrief, listTodayEvents } = await import('./prebrief.js')
+		const query = trimmed.slice(9).trim()
+		
+		if (!query) {
+			// No argument - list today's events
+			const list = await listTodayEvents()
+			return { handled: true, response: list }
+		}
+		
+		// Generate prebrief for specified event
+		const result = await createPrebrief(query)
+		
+		if (!result.success) {
+			return { handled: true, response: result.error || 'Failed to generate prebrief.' }
+		}
+		
+		// Format success response
+		const time = new Date(result.event!.start).toLocaleTimeString('en-GB', {
+			hour: '2-digit',
+			minute: '2-digit',
+		})
+		const response = [
+			`✅ Pre-brief generated for "${result.event!.summary}" at ${time}`,
+			'',
+			`📄 Saved to: ${result.filePath}`,
+			'',
+			'---',
+			'',
+			result.prebrief,
+		].join('\n')
+		
+		return { handled: true, response }
+	}
+
+	return { handled: false }
+}
+
+const sendToGateway = async (
+	baseUrl: string,
+	authToken: string | undefined,
+	payload: OutboundMessage
+): Promise<number | undefined> => {
+	const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+	if (authToken) {
+		headers.Authorization = `Bearer ${authToken}`
+	}
+
+	const httpUrl = baseUrl.replace(/^ws/, 'http').replace('/events', '')
+	try {
+		const response = await fetch(`${httpUrl}/send`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify(payload),
+		})
+		if (!response.ok) {
+			const body = await response.text().catch(() => '')
+			void logToFile('error', 'bridge send non-200', {
+				status: response.status,
+				chatId: payload.chatId,
+				body: body.slice(0, 1000),
+			}).catch(() => {})
+			return undefined
+		}
+		const parsed = (await response.json().catch(() => undefined)) as SendResponse | undefined
+		return parsed?.messageId
+	} catch (err) {
+		logError(`[jsonl-bridge] Failed to send message:`, err)
+		const message = err instanceof Error ? err.message : 'unknown error'
+		void logToFile('error', 'bridge send failed', { error: message, chatId: payload.chatId }).catch(() => {})
+		return undefined
+	}
+}
+
+const sendTyping = async (
+	baseUrl: string,
+	authToken: string | undefined,
+	chatId: number | string
+) => {
+	const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+	if (authToken) {
+		headers.Authorization = `Bearer ${authToken}`
+	}
+
+	const httpUrl = baseUrl.replace(/^ws/, 'http').replace('/events', '')
+	try {
+		await fetch(`${httpUrl}/typing`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ chatId }),
+		})
+	} catch {
+		// ignore typing errors
+	}
+}
+
+const sendFileToGateway = async (
+	baseUrl: string,
+	authToken: string | undefined,
+	chatId: number | string,
+	filePath: string,
+	caption?: string
+) => {
+	const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+	if (authToken) {
+		headers.Authorization = `Bearer ${authToken}`
+	}
+
+	const httpUrl = baseUrl.replace(/^ws/, 'http').replace('/events', '')
+	try {
+		const response = await fetch(`${httpUrl}/send`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ chatId, documentPath: filePath, caption }),
+		})
+		if (!response.ok) {
+			const body = await response.text().catch(() => '')
+			void logToFile('error', 'bridge send file non-200', {
+				status: response.status,
+				chatId,
+				filePath,
+				body: body.slice(0, 1000),
+			}).catch(() => {})
+			return false
+		}
+		return true
+	} catch (err) {
+		logError(`[jsonl-bridge] Failed to send file:`, err)
+		const message = err instanceof Error ? err.message : 'unknown error'
+		void logToFile('error', 'bridge send file failed', { error: message, chatId, filePath }).catch(() => {})
+		return false
+	}
+}
+
+const FILE_ATTACHMENT_INSTRUCTIONS = [
+	'File attachments:',
+	'If you create a file and want it sent as a Telegram attachment, include a line exactly:',
+	'[Sendfile: /absolute/path/to/file]',
+	'Optional next line: Caption: <text>',
+	'Auto-attach only scans ./tmp, ./out, ./output, ./artifacts, or the OS temp directory; [Sendfile] is most reliable.',
+].join('\n')
+
+const AUTO_ATTACH_ALLOWED_DIRS = ['tmp', 'out', 'output', 'artifacts']
+const AUTO_ATTACH_MAX_BYTES = 15 * 1024 * 1024
+
+const trimPathToken = (value: string): string =>
+	value.replace(/^[('"`]+|[)\]}'"`,.;:!?]+$/g, '')
+
+const resolveAttachmentPath = (rawPath: string, workingDirectory: string): string | null => {
+	let cleaned = rawPath.trim()
+	if (!cleaned) return null
+	if (cleaned.startsWith('file://')) {
+		cleaned = cleaned.slice('file://'.length)
+	}
+	cleaned = trimPathToken(cleaned)
+	if (!cleaned) return null
+	if (cleaned.startsWith('~/')) {
+		cleaned = join(homedir(), cleaned.slice(2))
+	}
+	if (!isAbsolute(cleaned)) {
+		cleaned = resolve(workingDirectory, cleaned)
+	}
+	return cleaned
+}
+
+const buildAutoAttachRoots = (workingDirectory: string): string[] => {
+	const roots = [tmpdir()]
+	for (const dir of AUTO_ATTACH_ALLOWED_DIRS) {
+		roots.push(resolve(workingDirectory, dir))
+	}
+	return roots
+}
+
+const isWithinAllowedRoots = (filePath: string, roots: string[]): boolean => {
+	const resolvedPath = resolve(filePath)
+	for (const root of roots) {
+		const resolvedRoot = resolve(root)
+		if (resolvedPath === resolvedRoot) return true
+		const rootWithSep = resolvedRoot.endsWith(sep) ? resolvedRoot : `${resolvedRoot}${sep}`
+		if (resolvedPath.startsWith(rootWithSep)) return true
+	}
+	return false
+}
+
+const collectPathCandidates = (text: string): string[] => {
+	const candidates = new Set<string>()
+	const directPattern = /(?:^|[\s(])((?:~\/|\.{1,2}\/|\/)[^\s)\]}'"`]+)/g
+	let match: RegExpExecArray | null
+	while ((match = directPattern.exec(text)) !== null) {
+		const candidate = trimPathToken(match[1] ?? '')
+		if (candidate) candidates.add(candidate)
+	}
+	const backtickPattern = /`([^`]+)`/g
+	while ((match = backtickPattern.exec(text)) !== null) {
+		const segment = match[1]?.trim()
+		if (!segment) continue
+		if (segment.startsWith('/') || segment.startsWith('./') || segment.startsWith('../') || segment.startsWith('~/')) {
+			candidates.add(trimPathToken(segment))
+			continue
+		}
+		for (const token of segment.split(/\s+/)) {
+			if (!token) continue
+			if (token.startsWith('/') || token.startsWith('./') || token.startsWith('../') || token.startsWith('~/')) {
+				candidates.add(trimPathToken(token))
+			}
+		}
+	}
+	return [...candidates]
+}
+
+const detectAutoAttachFiles = async (
+	text: string,
+	workingDirectory: string,
+	queuedPaths: Set<string>
+): Promise<SendfileCommand[]> => {
+	const roots = buildAutoAttachRoots(workingDirectory)
+	const candidates = collectPathCandidates(text)
+	const results: SendfileCommand[] = []
+
+	for (const candidate of candidates) {
+		const resolvedPath = resolveAttachmentPath(candidate, workingDirectory)
+		if (!resolvedPath) continue
+		if (queuedPaths.has(resolvedPath)) continue
+		if (!isWithinAllowedRoots(resolvedPath, roots)) continue
+		let stats
+		try {
+			stats = await stat(resolvedPath)
+		} catch {
+			continue
+		}
+		if (!stats.isFile()) continue
+		if (stats.size > AUTO_ATTACH_MAX_BYTES) continue
+		results.push({ path: resolvedPath })
+		queuedPaths.add(resolvedPath)
+	}
+
+	return results
+}
+
+const SUBAGENT_SPAWN_INSTRUCTIONS = [
+	'Subagent delegation:',
+	'If the user explicitly asks to use a subagent, respond with exactly one line:',
+	'/spawn "task description"',
+	'Do not include any other text before or after /spawn.',
+].join('\n')
+
+const isRecallQuestion = (text: string): boolean => {
+	const t = text.trim().toLowerCase()
+	if (!t) return false
+	// User asking about prior convo / personal/workspace state should trigger enforced recall.
+	return (
+		/(what|when|where|who)\s+did\s+(i|we)\s+(say|decide|agree|do)/.test(t) ||
+		/\b(remind me|remember|as i said|last time|previously|earlier)\b/.test(t) ||
+		/\b(my (todo|goals?|plans?|notes?|setup)|your (notes?|memory))\b/.test(t) ||
+		t.includes('in our last') ||
+		t.includes('in our previous')
+	)
+}
+
+const isSpawnDirectiveCandidate = (text: string): boolean =>
+	text.trimStart().startsWith('/spawn')
+
+const formatToolName = (name: string): string => {
+	const icons: Record<string, string> = {
+		Read: '📖',
+		Write: '✏️',
+		Edit: '✏️',
+		Execute: '⚡',
+		Bash: '⚡',
+		Grep: '🔍',
+		Glob: '🔍',
+		LS: '📁',
+		Create: '📝',
+		Task: '🤖',
+		WebSearch: '🌐',
+		FetchUrl: '🌐',
+	}
+	return `${icons[name] || '🔧'} ${name}`
+}
+
+type SpawnSubagentOptions = {
+	chatId: number | string
+	task: string
+	label?: string
+	cli?: string
+	explicitCli?: boolean
+	manifests: Map<string, CLIManifest>
+	defaultCli: string
+	subagentFallbackCli?: string
+	workingDirectory: string
+	memory?: MemoryConfig
+	model?: string
+	envFile?: string
+	send: (chatId: number | string, text: string) => Promise<void>
+	logMessage?: (
+		chatId: number | string,
+		role: 'user' | 'assistant' | 'system',
+		text: string,
+		sessionId?: string,
+		cli?: string,
+		meta?: { isSubagent?: boolean; subagentRunId?: string; parentSessionId?: string }
+	) => Promise<void>
+	parentSessionId?: string
+}
+
+type SpawnSubagentInternalOptions = SpawnSubagentOptions & {
+	throwOnError?: boolean
+}
+
+const spawnSubagentInternal = async (opts: SpawnSubagentInternalOptions): Promise<SubagentRunRecord | null> => {
+	const { chatId, task, label, manifests, defaultCli, workingDirectory, send } = opts
+	const requestedCli = opts.cli || defaultCli
+	let cliName = requestedCli
+	let usedFallback = false
+
+	if (!opts.explicitCli && requestedCli === 'droid' && opts.subagentFallbackCli) {
+		if (manifests.has(opts.subagentFallbackCli)) {
+			cliName = opts.subagentFallbackCli
+			usedFallback = true
+		} else {
+			await send(chatId, `⚠️ Subagent fallback CLI not found: ${opts.subagentFallbackCli}. Using droid.`)
+		}
+	}
+
+	// Check concurrency limit
+	if (!subagentRegistry.canSpawn(chatId)) {
+		const message = 'Too many subagents running'
+		if (opts.throwOnError) throw new Error(message)
+		await send(chatId, '⚠️ Too many subagents running. Stop some first with /subagents stop all')
+		return null
+	}
+
+	const manifest = manifests.get(cliName)
+	if (!manifest) {
+		const message = `CLI not found: ${cliName}`
+		if (opts.throwOnError) throw new Error(message)
+		await send(chatId, `❌ ${message}`)
+		return null
+	}
+
+	// Register the run
+	const record = subagentRegistry.spawn({
+		chatId,
+		task,
+		cli: cliName,
+		label,
+		parentSessionId: opts.parentSessionId,
+	})
+
+	if (opts.logMessage) {
+		void opts.logMessage(chatId, 'user', task, undefined, cliName, {
+			isSubagent: true,
+			subagentRunId: record.runId,
+			parentSessionId: opts.parentSessionId,
+		})
+	}
+
+	const displayName = label || `Subagent #${record.runId.slice(0, 8)}`
+	// Send spawn confirmation immediately - subagent runs in background
+	const fallbackNote = usedFallback ? ` (fallback from ${requestedCli})` : ''
+	await send(chatId, `🚀 Spawned: ${displayName}\n   CLI: ${cliName}${fallbackNote}\n   Task: ${task.slice(0, 100)}${task.length > 100 ? '...' : ''}`)
+
+	log(`[jsonl-bridge] Spawning subagent ${record.runId} with ${cliName}: "${task.slice(0, 50)}..."`)
+
+	// Run subagent in background on the Subagent lane (fire-and-forget)
+	void enqueueCommandInLane(CommandLane.Subagent, async () => {
+		// Create a new session for the subagent (marked as subagent, no resume - fresh context)
+		const session = new JsonlSession(`subagent-${record.runId}`, manifest, workingDirectory, { isSubagent: true, envFile: opts.envFile })
+
+		let lastText = ''
+		let loggedFinal = false
+		let startedAnnounced = false
+
+		return new Promise<void>((resolve) => {
+			session.on('event', (evt: BridgeEvent) => {
+				switch (evt.type) {
+					case 'started': {
+						subagentRegistry.markRunning(record.runId, evt.sessionId)
+						log(`[jsonl-bridge] Subagent ${record.runId} started: ${evt.sessionId}`)
+						if (!startedAnnounced) {
+							startedAnnounced = true
+							const startedLabel = label || `Subagent #${record.runId.slice(0, 8)}`
+							void send(chatId, `🔄 Started: ${startedLabel}`)
+						}
+						break
+					}
+
+					case 'text':
+						if (evt.text) {
+							lastText = evt.text
+						}
+						break
+
+					case 'completed':
+						log(`[jsonl-bridge] Subagent ${record.runId} completed`)
+						subagentRegistry.markCompleted(record.runId, evt.answer || lastText)
+						if (opts.logMessage) {
+							loggedFinal = true
+							void opts.logMessage(chatId, 'assistant', evt.answer || lastText, evt.sessionId, cliName, {
+								isSubagent: true,
+								subagentRunId: record.runId,
+								parentSessionId: opts.parentSessionId,
+							})
+						}
+						// Announce completion
+						void send(chatId, formatSubagentAnnouncement(subagentRegistry.get(record.runId)!))
+						// Prune old runs and persist
+						subagentRegistry.prune(chatId)
+						void saveSubagentRegistry()
+						break
+
+					case 'error':
+						log(`[jsonl-bridge] Subagent ${record.runId} error: ${evt.message}`)
+						subagentRegistry.markError(record.runId, evt.message)
+						if (opts.logMessage && !loggedFinal) {
+							loggedFinal = true
+							void opts.logMessage(chatId, 'system', evt.message, record.childSessionId, cliName, {
+								isSubagent: true,
+								subagentRunId: record.runId,
+								parentSessionId: opts.parentSessionId,
+							})
+						}
+						void send(chatId, formatSubagentAnnouncement(subagentRegistry.get(record.runId)!))
+						void saveSubagentRegistry()
+						break
+				}
+			})
+
+			session.on('exit', (code) => {
+				log(`[jsonl-bridge] Subagent ${record.runId} exited with code ${code}`)
+				// If exited without completing, mark as error
+				const current = subagentRegistry.get(record.runId)
+				if (current && current.status === 'running') {
+					subagentRegistry.markError(record.runId, `Process exited with code ${code}`)
+					void send(chatId, formatSubagentAnnouncement(subagentRegistry.get(record.runId)!))
+					if (opts.logMessage && !loggedFinal) {
+						loggedFinal = true
+						void opts.logMessage(chatId, 'system', `Process exited with code ${code}`, current.childSessionId, cliName, {
+							isSubagent: true,
+							subagentRunId: record.runId,
+							parentSessionId: opts.parentSessionId,
+						})
+					}
+				}
+				resolve()
+			})
+
+			// Run the subagent (no resume token - fresh session)
+			const run = async () => {
+				let prompt = task
+				prompt = `${FILE_ATTACHMENT_INSTRUCTIONS}\n\n${prompt}`
+				// Deterministic boot context for fresh subagents
+				try {
+					const boot = await buildBootContext(workingDirectory, { mode: 'subagent' })
+					if (boot) prompt = `${boot}\n\n${prompt}`
+				} catch {
+					// ignore
+				}
+				session.run(prompt, undefined, { model: resolveModelForCli(cliName, opts.model) })
+			}
+			void run()
+		})
+	})
+
+	return record
+}
+
+const spawnSubagent = async (opts: SpawnSubagentOptions): Promise<void> => {
+	await spawnSubagentInternal(opts)
+}
+
+export const startBridge = async (config: BridgeConfig): Promise<BridgeHandle> => {
+	// Initialize lane-based command queue with default concurrency
+	initDefaultLanes()
+	log('[jsonl-bridge] Initialized command lanes (Main: 1, Subagent: 4, Cron: 1)')
+
+	const manifests = await loadAllManifests(config.adaptersDir)
+	if (manifests.size === 0) {
+		logWarn('[jsonl-bridge] No CLI adapters found in', config.adaptersDir)
+	}
+
+	const sessionStore = createSessionStore()
+	const persistentStore = await createPersistentSessionStore()
+	const cronService = new CronService()
+	await cronService.start()
+	const conceptsIndex = createConceptsIndex(config.workingDirectory)
+	const repoNames = await getRepoNames(config.workingDirectory)
+	
+	log(`[jsonl-bridge] Loaded ${persistentStore.resumeTokens.size} resume tokens`)
+
+	// Load subagent registry from disk
+	const subagentCount = await loadSubagentRegistry()
+	if (subagentCount > 0) {
+		log(`[jsonl-bridge] Restored ${subagentCount} subagent records`)
+	}
+
+	// Sync session logs to memory on startup (gateway restart)
+	try {
+		const result = await syncSessionToMemory(config.workingDirectory)
+		if (result.written) {
+			log(`[jsonl-bridge] Synced ${result.entries} messages to memory on startup`)
+		}
+	} catch (err) {
+		logError('[jsonl-bridge] Failed to sync memory on startup:', err)
+	}
+
+	const buildRelatedContext = async (text: string): Promise<string | null> => {
+		try {
+			const index = await conceptsIndex.loadIndex()
+			if (!index) return null
+
+			const conceptConfig = await loadConceptConfig(conceptsIndex.getConfigDir())
+			const terms = extractConceptsFromText(text, conceptConfig, repoNames)
+			if (terms.length === 0) return null
+
+			const relatedFiles = getRelatedFilesForTerms(index, terms, 5)
+			if (relatedFiles.length === 0) return null
+
+			return `Related files:\n${relatedFiles.map(file => `- ${file}`).join('\n')}`
+		} catch (err) {
+			const message = err instanceof Error ? err.message : 'unknown error'
+			logError('[jsonl-bridge] Failed to build related context:', message)
+			return null
+		}
+	}
+
+	const wsUrl = config.gatewayUrl.replace(/^http/, 'ws')
+	const wsEndpoint = wsUrl.endsWith('/events') ? wsUrl : `${wsUrl}/events`
+
+	const headers: Record<string, string> = {}
+	if (config.authToken) {
+		headers.Authorization = `Bearer ${config.authToken}`
+	}
+
+	const ws = new WebSocket(wsEndpoint, { headers })
+	const normalizedOutputEnabled = config.normalizedOutput === true || process.env.TG_GATEWAY_NORMALIZED_OUTPUT === '1'
+
+	const send = async (chatId: number | string, text: string): Promise<void> => {
+		await sendToGateway(config.gatewayUrl, config.authToken, { chatId, text })
+	}
+	const sendWithId = (chatId: number | string, text: string) =>
+		sendToGateway(config.gatewayUrl, config.authToken, { chatId, text })
+	const sendEdit = (chatId: number | string, messageId: number, text: string) =>
+		sendToGateway(config.gatewayUrl, config.authToken, { chatId, text, editMessageId: messageId })
+
+	const typing = (chatId: number | string) =>
+		sendTyping(config.gatewayUrl, config.authToken, chatId)
+
+	// Track the primary chat for cron job delivery and MCP spawn
+	// Initialize from config if available so MCP can spawn before any Telegram message
+	let primaryChatId: number | string | null = config.allowedChatIds?.[0] ?? null
+	if (primaryChatId) {
+		log(`[jsonl-bridge] Primary chat initialized from config: ${primaryChatId}`)
+	}
+
+	type MessageContext = {
+		source?: 'user' | 'cron' | 'memory-tool' | 'session-tool'
+		cronJobId?: string
+		cronExpectations?: CronOutputExpectation[]
+		memoryToolDepth?: number
+		sessionToolDepth?: number
+		isPrivateChat?: boolean
+	}
+
+	const processMessage = async (chatId: number | string, prompt: string, context?: MessageContext) => {
+		const t0 = Date.now()
+		const originalPrompt = prompt
+		const isMainSession = context?.isPrivateChat === true
+		let cronMarked = false
+
+		// Use active CLI for this chat, or default (check persistent store first)
+		const cliName = persistentStore.getActiveCli(chatId) || sessionStore.getActiveCli(chatId) || config.defaultCli
+		
+		// Get existing resume token for this specific CLI
+		const resumeToken = sessionStore.getResumeToken(chatId, cliName)
+
+		// Deterministic boot context for fresh sessions (after restart or /new)
+		if (!resumeToken && isMainSession) {
+			try {
+				const boot = await buildBootContext(config.workingDirectory, { mode: 'main' })
+				if (boot) {
+					prompt = `${boot}\n\n${prompt}`
+				}
+			} catch {
+				// ignore boot context failures
+			}
+		}
+
+		// Inject any pending subagent results into the prompt
+		const pendingResults = formatPendingResultsForInjection(chatId, resumeToken?.sessionId)
+		if (pendingResults) {
+			prompt = `${pendingResults}\n\n${prompt}`
+			log(`[jsonl-bridge] Injected subagent results into prompt`)
+		}
+
+		const recallRequired =
+			config.memory?.enabled === true &&
+			isMainSession &&
+			context?.source !== 'memory-tool' &&
+			isRecallQuestion(originalPrompt)
+		if (config.memory?.enabled && isMainSession) {
+			try {
+				const memoryRecall = await buildMemoryRecall(originalPrompt, config.memory)
+				if (memoryRecall) {
+					prompt = `${memoryRecall}\n\n${prompt}`
+				}
+				if (context?.source !== 'memory-tool') {
+					const memoryTools = buildMemoryToolInstructions()
+					prompt = `${memoryTools}\n\n${prompt}`
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : 'unknown error'
+				logError('[jsonl-bridge] Failed to build memory recall:', message)
+			}
+		}
+
+		// Session tools are always available (for cross-session inspection/communication)
+		if (context?.source !== 'session-tool') {
+			prompt = `${buildSessionToolInstructions()}\n\n${prompt}`
+		}
+		prompt = `${FILE_ATTACHMENT_INSTRUCTIONS}\n\n${prompt}`
+
+		// Enforce tool-based recall for recall questions (forces a tool call loop)
+		if (recallRequired) {
+			prompt = `${buildRecallEnforcementHint()}\n\n${prompt}`
+		}
+
+		if (!context?.source) {
+			prompt = `${SUBAGENT_SPAWN_INSTRUCTIONS}\n\n${prompt}`
+		}
+
+		const relatedContext = await buildRelatedContext(originalPrompt)
+		if (relatedContext) {
+			prompt = `${prompt}\n\n${relatedContext}`
+		}
+
+		// Log user message
+		const logRole = context?.source === 'memory-tool' || context?.source === 'session-tool' ? 'system' : 'user'
+		void persistentStore.logMessage(chatId, logRole, originalPrompt, undefined, cliName)
+		const manifest = manifests.get(cliName)
+		if (!manifest) {
+			log(`[jsonl-bridge] CLI '${cliName}' not found`)
+			await send(chatId, `CLI '${cliName}' not found. Check adapters directory.`)
+			return
+		}
+
+		log(`[jsonl-bridge] [${Date.now() - t0}ms] Starting ${cliName} session for ${chatId}${resumeToken ? ' (resuming)' : ''}`)
+
+		// Start typing immediately (before CLI spawns)
+		let typingInterval: ReturnType<typeof setInterval> | null = null
+		void typing(chatId)
+		typingInterval = setInterval(() => void typing(chatId), 4000)
+
+		const stopTypingLoop = () => {
+			if (typingInterval) {
+				clearInterval(typingInterval)
+				typingInterval = null
+			}
+		}
+
+		const runPiToolExecutor: ToolExecutor | undefined = cliName === 'pi'
+			? async ({ toolName, args }) => {
+				const payload = JSON.stringify({ tool: toolName, ...args })
+				if (toolName.startsWith('memory_')) {
+					if (!config.memory?.enabled) {
+						return { isError: true, error: 'Memory tools disabled' }
+					}
+					const call = parseMemoryToolCall(payload)
+					if (!call) {
+						return { isError: true, error: `Invalid memory tool call: ${toolName}` }
+					}
+					const result = await runMemoryTool(call, config.memory as MemoryConfig)
+					return { result, isError: false }
+				}
+				if (toolName.startsWith('sessions_')) {
+					const call = parseSessionToolCall(payload)
+					if (!call) {
+						return { isError: true, error: `Invalid session tool call: ${toolName}` }
+					}
+					const result = await runSessionTool(call, {
+						workspaceDir: config.workingDirectory,
+						currentChatId: chatId,
+						sendToChat: send,
+						spawnSubagent: async ({ chatId: targetChatId, task, label, cli }) => {
+							const activeCli = persistentStore.getActiveCli(targetChatId) || sessionStore.getActiveCli(targetChatId) || config.defaultCli
+							const settings = persistentStore.getChatSettings(targetChatId)
+							const record = await spawnSubagentInternal({
+								chatId: targetChatId,
+								task,
+								label,
+								cli: cli || activeCli,
+								explicitCli: Boolean(cli),
+								manifests,
+								defaultCli: config.defaultCli,
+								subagentFallbackCli: config.subagentFallbackCli,
+								workingDirectory: config.workingDirectory,
+								memory: config.memory,
+								model: settings.model,
+								envFile: config.envFile,
+								send,
+								logMessage: persistentStore.logMessage,
+								parentSessionId: currentSessionId,
+							})
+							return record ? { runId: record.runId } : null
+						},
+					})
+					return { result, isError: false }
+				}
+				return { isError: true, error: `Unsupported tool: ${toolName}` }
+			}
+			: undefined
+
+		const usesPiRpc = manifest.name === 'pi' && manifest.args.some((arg, idx, arr) => arg === '--mode' && arr[idx + 1] === 'rpc')
+		const session = new JsonlSession(chatId, manifest, config.workingDirectory, {
+			envFile: config.envFile,
+			toolExecutor: usesPiRpc ? runPiToolExecutor : undefined,
+		})
+		sessionStore.set(session)
+
+		// Get chat settings dynamically (allows mid-session changes via /stream and /verbose)
+		const getSettings = () => persistentStore.getChatSettings(chatId)
+		let lastToolStatus: string | null = null
+		let currentSessionId: string | undefined
+		const taskRunByToolId = new Map<string, string>()
+		let streamBuffer = ''
+		let lastStreamedBuffer = ''
+		let streamedTextForEdit = ''
+		let streamedTextForAppend = ''
+		let streamMessageId: number | undefined
+		let streamTruncated = false
+		let streamTimer: ReturnType<typeof setTimeout> | null = null
+		let streamFlushChain: Promise<void> = Promise.resolve()
+		const streamUsesEdits = true
+		const STREAM_MIN_CHARS = 800
+		const STREAM_IDLE_MS = 1500
+
+		// Track files to send at completion (during streaming we just note them)
+		const pendingFiles: Array<{ path: string; caption?: string }> = []
+		const normalizationEvents: BridgeEvent[] = []
+
+		const flushStreamBufferInternal = async (force = false) => {
+			if (streamTimer) {
+				clearTimeout(streamTimer)
+				streamTimer = null
+			}
+			if (!streamBuffer || (!force && streamBuffer.length < STREAM_MIN_CHARS)) return
+			if (isSpawnDirectiveCandidate(streamBuffer)) return
+
+			const delta = streamBuffer.startsWith(lastStreamedBuffer)
+				? streamBuffer.slice(lastStreamedBuffer.length)
+				: streamBuffer
+			if (!delta.trim()) return
+			if (lastStreamedBuffer && lastStreamedBuffer.startsWith(streamBuffer)) return
+
+			// Extract any [Sendfile:] commands from streaming delta
+			const { files } = extractSendfileCommands(delta)
+			const deltaText = stripSendfileCommands(delta, { trim: false })
+
+			// Queue files to send after completion (don't send mid-stream)
+			for (const file of files) {
+				const resolvedPath = resolveAttachmentPath(file.path, config.workingDirectory)
+				if (!resolvedPath) continue
+				if (!pendingFiles.some(f => f.path === resolvedPath)) {
+					pendingFiles.push({ ...file, path: resolvedPath })
+				}
+			}
+
+			if (streamUsesEdits) {
+				const { remainingText: fullRemainingText } = extractSendfileCommands(streamBuffer)
+				const toSend = fullRemainingText.trim()
+				if (!toSend) {
+					lastStreamedBuffer = streamBuffer
+					return
+				}
+				if (streamMessageId && toSend === streamedTextForEdit) {
+					lastStreamedBuffer = streamBuffer
+					return
+				}
+				const chunks = splitMessage(toSend)
+				const primary = chunks[0] ?? ''
+				const truncated = chunks.length > 1
+				if (!primary.trim()) {
+					lastStreamedBuffer = streamBuffer
+					return
+				}
+				if (streamMessageId) {
+					await sendEdit(chatId, streamMessageId, primary)
+				} else {
+					streamMessageId = await sendWithId(chatId, primary)
+				}
+				streamedTextForEdit = primary
+				streamTruncated = truncated
+				lastStreamedBuffer = streamBuffer
+				return
+			}
+
+			const toSend = deltaText
+			if (!toSend.trim()) {
+				lastStreamedBuffer = streamBuffer
+				return
+			}
+			const chunks = splitMessage(toSend)
+			for (const chunk of chunks) {
+				await send(chatId, chunk)
+			}
+			streamedTextForAppend += toSend
+			lastStreamedBuffer = streamBuffer
+		}
+
+		const flushStreamBuffer = (force = false) => {
+			streamFlushChain = streamFlushChain.then(
+				() => flushStreamBufferInternal(force),
+				() => flushStreamBufferInternal(force)
+			)
+			return streamFlushChain
+		}
+
+		const scheduleStreamFlush = () => {
+			if (streamTimer) clearTimeout(streamTimer)
+			streamTimer = setTimeout(() => void flushStreamBuffer(true), STREAM_IDLE_MS)
+		}
+
+		session.on('event', async (evt: BridgeEvent) => {
+			normalizationEvents.push(evt)
+			switch (evt.type) {
+				case 'started':
+					log(`[jsonl-bridge] [${Date.now() - t0}ms] Session started: ${evt.sessionId}`)
+					currentSessionId = evt.sessionId
+					sessionStore.setResumeToken(chatId, cliName, { engine: cliName, sessionId: evt.sessionId })
+					break
+
+				case 'thinking':
+					// Thinking is not sent to user
+					break
+
+				case 'text':
+					// Handle streaming text if enabled (check dynamically)
+					if (getSettings().streaming && evt.text) {
+						if (!streamBuffer) {
+							streamBuffer = evt.text
+						} else if (evt.text.startsWith(streamBuffer)) {
+							// Snapshot-style updates (full text so far)
+							streamBuffer = evt.text
+						} else if (streamBuffer.startsWith(evt.text)) {
+							// Older snapshot, ignore
+						} else {
+							// Incremental chunk
+							streamBuffer += evt.text
+						}
+						if (streamBuffer.length >= STREAM_MIN_CHARS) {
+							await flushStreamBuffer(true)
+						} else {
+							scheduleStreamFlush()
+						}
+					}
+					break
+
+				case 'tool_start': {
+					// Map Droid Task tool calls to subagent records
+					if (evt.name === 'Task') {
+						const input = evt.input ?? {}
+						const description = typeof input.description === 'string' ? input.description : undefined
+						const prompt = typeof input.prompt === 'string'
+							? input.prompt
+							: typeof description === 'string'
+								? description
+								: 'Task'
+						if (!taskRunByToolId.has(evt.toolId)) {
+							const record = subagentRegistry.spawn({
+								chatId,
+								task: prompt,
+								cli: cliName,
+								label: description,
+								parentSessionId: currentSessionId,
+							})
+							subagentRegistry.markRunning(record.runId, evt.toolId)
+							taskRunByToolId.set(evt.toolId, record.runId)
+							void saveSubagentRegistry()
+						}
+					}
+					if (getSettings().verbose) {
+						const status = formatToolName(evt.name)
+						if (status !== lastToolStatus) {
+							lastToolStatus = status
+							await send(chatId, status)
+						}
+					}
+					break
+				}
+
+				case 'tool_end':
+					if (taskRunByToolId.has(evt.toolId)) {
+						const runId = taskRunByToolId.get(evt.toolId) as string
+						taskRunByToolId.delete(evt.toolId)
+						if (evt.isError) {
+							subagentRegistry.markError(runId, evt.preview || 'Task failed')
+						} else {
+							subagentRegistry.markCompleted(runId, evt.preview || '(no output)')
+						}
+						void send(chatId, formatSubagentAnnouncement(subagentRegistry.get(runId)!))
+						subagentRegistry.prune(chatId)
+						void saveSubagentRegistry()
+					}
+					if (getSettings().verbose) {
+						if (evt.isError) {
+							await send(chatId, `❌ Tool failed`)
+						} else if (evt.preview) {
+							const preview = evt.preview.length > 200 ? evt.preview.slice(0, 200) + '...' : evt.preview
+							await send(chatId, `📤 ${preview}`)
+						}
+					}
+					break
+
+					case 'completed': {
+						stopTypingLoop()
+						if (streamTimer) {
+							clearTimeout(streamTimer)
+							streamTimer = null
+						}
+						const expectationError = !evt.isError
+							? validateCronExpectations(evt.answer ?? '', context?.cronExpectations)
+							: undefined
+						if (context?.cronJobId && !cronMarked) {
+							const errorMessage = evt.isError ? (evt.answer || 'error') : expectationError
+							cronService.markComplete(context.cronJobId, errorMessage)
+							cronMarked = true
+						}
+						if (expectationError) {
+							await send(chatId, `❌ Cron validation failed: ${expectationError}`)
+						}
+						const assistantSpawn = evt.answer ? parseAssistantSpawnCommand(evt.answer) : null
+						if (!assistantSpawn && getSettings().streaming) {
+							await flushStreamBuffer(true)
+						}
+						log(`[jsonl-bridge] Completed: ${evt.sessionId}`)
+						sessionStore.setResumeToken(chatId, cliName, { engine: cliName, sessionId: evt.sessionId })
+						void persistentStore.setResumeToken(chatId, cliName, { engine: cliName, sessionId: evt.sessionId })
+
+						if (assistantSpawn) {
+							const activeCli = persistentStore.getActiveCli(chatId) || sessionStore.getActiveCli(chatId) || cliName
+							const settings = getSettings()
+							void spawnSubagent({
+								chatId,
+								task: assistantSpawn.task,
+								label: assistantSpawn.label,
+								cli: assistantSpawn.cli || activeCli,
+								explicitCli: Boolean(assistantSpawn.cli),
+								manifests,
+								defaultCli: config.defaultCli,
+								subagentFallbackCli: config.subagentFallbackCli,
+								workingDirectory: config.workingDirectory,
+								memory: config.memory,
+								model: settings.model,
+								envFile: config.envFile,
+								send,
+								logMessage: persistentStore.logMessage,
+								parentSessionId: currentSessionId,
+							})
+							break
+						}
+
+						// Send any files that were queued during streaming
+						for (const file of pendingFiles) {
+							log(`[jsonl-bridge] Sending queued file attachment: ${file.path}`)
+							const sent = await sendFileToGateway(config.gatewayUrl, config.authToken, chatId, file.path, file.caption)
+							if (!sent) {
+								await send(chatId, `❌ Failed to send file: ${file.path}`)
+							}
+						}
+
+						if (evt.answer) {
+							const toolDepth = context?.memoryToolDepth ?? 0
+							const shouldCheckTool =
+								config.memory?.enabled === true &&
+								!getSettings().streaming &&
+								toolDepth < 2
+							let toolCall: MemoryToolCall | null = null
+							if (shouldCheckTool) {
+								toolCall = parseMemoryToolCall(evt.answer)
+							}
+							if (toolCall) {
+								try {
+									const toolResult = await runMemoryTool(toolCall, config.memory as MemoryConfig)
+									const toolPrompt = formatMemoryToolResultPrompt(toolCall, toolResult, originalPrompt)
+									await processMessage(chatId, toolPrompt, {
+										...context,
+										source: 'memory-tool',
+										memoryToolDepth: toolDepth + 1,
+									})
+									break
+								} catch (err) {
+									const message = err instanceof Error ? err.message : 'unknown error'
+									logError('[jsonl-bridge] Memory tool failed:', message)
+								}
+							}
+
+							// Session tools (always available)
+							const sessionToolDepth = context?.sessionToolDepth ?? 0
+							const shouldCheckSessionTool = !getSettings().streaming && sessionToolDepth < 2
+							let sessionToolCall: SessionToolCall | null = null
+							if (shouldCheckSessionTool) {
+								sessionToolCall = parseSessionToolCall(evt.answer)
+							}
+							if (sessionToolCall) {
+								try {
+									const toolResult = await runSessionTool(sessionToolCall, {
+										workspaceDir: config.workingDirectory,
+										currentChatId: chatId,
+										sendToChat: send,
+										spawnSubagent: async ({ chatId: targetChatId, task, label, cli }) => {
+											const activeCli = persistentStore.getActiveCli(targetChatId) || sessionStore.getActiveCli(targetChatId) || config.defaultCli
+											const settings = persistentStore.getChatSettings(targetChatId)
+											const record = await spawnSubagentInternal({
+												chatId: targetChatId,
+												task,
+												label,
+												cli: cli || activeCli,
+												explicitCli: Boolean(cli),
+												manifests,
+												defaultCli: config.defaultCli,
+												subagentFallbackCli: config.subagentFallbackCli,
+												workingDirectory: config.workingDirectory,
+												memory: config.memory,
+												model: settings.model,
+												envFile: config.envFile,
+												send,
+												logMessage: persistentStore.logMessage,
+												parentSessionId: currentSessionId,
+											})
+											return record ? { runId: record.runId } : null
+										},
+									})
+									const toolPrompt = formatSessionToolResultPrompt(sessionToolCall, toolResult, originalPrompt)
+									await processMessage(chatId, toolPrompt, {
+										...context,
+										source: 'session-tool',
+										sessionToolDepth: sessionToolDepth + 1,
+									})
+									break
+								} catch (err) {
+									const message = err instanceof Error ? err.message : 'unknown error'
+									logError('[jsonl-bridge] Session tool failed:', message)
+								}
+							}
+
+						void persistentStore.logMessage(chatId, 'assistant', evt.answer, evt.sessionId, cliName)
+						// Post-turn durable flush (best-effort)
+						try {
+							if (config.memory?.enabled && isMainSession) {
+								void maybeAutoFlushSessionToMemory(config.workingDirectory)
+							}
+						} catch {
+							// ignore
+						}
+
+					const settings = getSettings()
+					const useNormalizedOutput = normalizedOutputEnabled && !settings.streaming
+					const { files: sendfileFiles, remainingText } = extractSendfileCommands(evt.answer)
+					const resolvedSendfileFiles = sendfileFiles
+						.map((file) => {
+							const resolvedPath = resolveAttachmentPath(file.path, config.workingDirectory)
+							return resolvedPath ? { ...file, path: resolvedPath } : null
+						})
+						.filter((file): file is SendfileCommand => Boolean(file))
+					const textToSend = resolvedSendfileFiles.length > 0 ? remainingText : evt.answer
+					const queuedPaths = new Set(pendingFiles.map((file) => file.path))
+					for (const file of resolvedSendfileFiles) {
+						queuedPaths.add(file.path)
+					}
+					const autoFiles = await detectAutoAttachFiles(textToSend, config.workingDirectory, queuedPaths)
+
+					if (useNormalizedOutput) {
+						const normalized = normalizeBridgeEvents(normalizationEvents, {
+								chatId,
+								cli: cliName,
+								model: settings.model,
+								transport: 'telegram',
+								conversationId: String(chatId),
+								sessionId: currentSessionId,
+								verbose: settings.verbose,
+								streaming: settings.streaming,
+							})
+						if (normalized.attachments?.length) {
+							normalized.attachments = normalized.attachments
+								.map((attachment) => {
+									const resolvedPath = resolveAttachmentPath(attachment.path, config.workingDirectory)
+									return resolvedPath ? { ...attachment, path: resolvedPath } : null
+								})
+								.filter((attachment): attachment is NonNullable<typeof normalized.attachments>[number] => Boolean(attachment))
+						}
+							await sendToGateway(config.gatewayUrl, config.authToken, {
+								chatId,
+								text: textToSend,
+								structured: normalized,
+							})
+						for (const file of autoFiles) {
+							log(`[jsonl-bridge] Auto-attaching file: ${file.path}`)
+							const sent = await sendFileToGateway(config.gatewayUrl, config.authToken, chatId, file.path, file.caption)
+							if (!sent) {
+								logWarn(`[jsonl-bridge] Auto-attach failed for ${file.path}`)
+							}
+						}
+						} else {
+							// Extract and send any file attachments from the response (for non-streaming case)
+						for (const file of resolvedSendfileFiles) {
+								// Skip if already sent from pendingFiles
+								if (pendingFiles.some(f => f.path === file.path)) continue
+								log(`[jsonl-bridge] Sending file attachment: ${file.path}`)
+								const sent = await sendFileToGateway(config.gatewayUrl, config.authToken, chatId, file.path, file.caption)
+								if (!sent) {
+									await send(chatId, `❌ Failed to send file: ${file.path}`)
+								}
+							}
+						for (const file of autoFiles) {
+							log(`[jsonl-bridge] Auto-attaching file: ${file.path}`)
+							const sent = await sendFileToGateway(config.gatewayUrl, config.authToken, chatId, file.path, file.caption)
+							if (!sent) {
+								logWarn(`[jsonl-bridge] Auto-attach failed for ${file.path}`)
+							}
+						}
+
+							// Send remaining text (if any, and not already streamed)
+						if (textToSend) {
+							if (settings.streaming) {
+								const fullText = textToSend
+								if (!fullText.trim()) {
+									// nothing to send
+								} else if (streamUsesEdits && streamMessageId) {
+									const trimmed = fullText.trim()
+									if (streamTruncated) {
+										if (trimmed.startsWith(streamedTextForEdit)) {
+											const remainder = trimmed.slice(streamedTextForEdit.length).trim()
+											if (remainder) {
+												const chunks = splitMessage(remainder)
+												for (const chunk of chunks) {
+													await send(chatId, chunk)
+												}
+											}
+										} else if (trimmed !== streamedTextForEdit) {
+											const chunks = splitMessage(trimmed)
+											for (const chunk of chunks) {
+												await send(chatId, chunk)
+											}
+										}
+									}
+								} else if (!streamUsesEdits) {
+									if (streamedTextForAppend && fullText.startsWith(streamedTextForAppend)) {
+										const remainder = fullText.slice(streamedTextForAppend.length)
+										if (remainder.trim()) {
+											const chunks = splitMessage(remainder)
+											for (const chunk of chunks) {
+												await send(chatId, chunk)
+											}
+										}
+									} else if (!streamedTextForAppend || fullText !== streamedTextForAppend) {
+										const chunks = splitMessage(fullText)
+										for (const chunk of chunks) {
+											await send(chatId, chunk)
+										}
+									}
+								} else {
+									const chunks = splitMessage(fullText)
+									for (const chunk of chunks) {
+										await send(chatId, chunk)
+									}
+								}
+							} else {
+								const chunks = splitMessage(textToSend)
+								for (const chunk of chunks) {
+									await send(chatId, chunk)
+								}
+							}
+						}
+						}
+					}
+					if (evt.cost) {
+						await send(chatId, `💰 Cost: $${evt.cost.toFixed(4)}`)
+					}
+					break
+				}
+
+					case 'error':
+						stopTypingLoop()
+						if (streamTimer) {
+							clearTimeout(streamTimer)
+							streamTimer = null
+						}
+						if (context?.cronJobId && !cronMarked) {
+							cronService.markComplete(context.cronJobId, evt.message)
+							cronMarked = true
+						}
+						await send(chatId, `❌ ${evt.message}`)
+						break
+				}
+			})
+
+		session.on('exit', (code) => {
+			stopTypingLoop()
+			log(`[jsonl-bridge] Session exited with code ${code}`)
+			if (context?.cronJobId && !cronMarked) {
+				cronService.markComplete(context.cronJobId, `Process exited with code ${code}`)
+				cronMarked = true
+			}
+			sessionStore.delete(chatId)
+			// Flush queue after session ends
+			void flushQueue(chatId)
+		})
+
+		// Run with resume token if we have one
+		const settings = getSettings()
+		const resolvedModel = resolveModelForCli(cliName, settings.model)
+		if (settings.model && !resolvedModel) {
+			log(`[jsonl-bridge] Ignoring incompatible model '${settings.model}' for ${cliName}`)
+		}
+		session.run(prompt, resumeToken, { model: resolvedModel })
+	}
+
+	const flushQueue = async (chatId: number | string) => {
+		const next = sessionStore.dequeue(chatId)
+		if (!next) return
+		log(`[jsonl-bridge] Flushing queued message for ${chatId}`)
+		await processMessage(chatId, next.text, next.context)
+	}
+
+	const handleMessage = async (message: IncomingMessage) => {
+		const { chatId, text, attachments, forward } = message
+		if (!text && !attachments?.length) return
+		const raw = typeof message.raw === 'object' && message.raw ? (message.raw as Record<string, unknown>) : undefined
+		const cronJobId = raw?.cron === true && typeof raw.jobId === 'string' ? raw.jobId : undefined
+		const cronExpectations = cronJobId ? parseCronExpectations(raw?.cronExpectations) : undefined
+		const chat = typeof raw?.chat === 'object' && raw.chat ? (raw.chat as Record<string, unknown>) : undefined
+		const chatType = typeof chat?.type === 'string' ? chat.type : undefined
+		const isPrivateChat = chatType === 'private'
+		const context: MessageContext | undefined = cronJobId
+			? { source: 'cron', cronJobId, cronExpectations, isPrivateChat }
+			: { isPrivateChat }
+		if (!context?.cronJobId) {
+			void triggerHeartbeat()
+		}
+
+		// Build prompt with image paths if present
+		let prompt = text || ''
+		
+		// Handle forwarded messages - prepend context about the original sender
+		if (forward) {
+			let forwardContext = '[Forwarded message'
+			if (forward.fromUser) {
+				const name = [forward.fromUser.firstName, forward.fromUser.lastName].filter(Boolean).join(' ')
+				forwardContext += ` from ${name || 'unknown user'}`
+				if (forward.fromUser.username) {
+					forwardContext += ` (@${forward.fromUser.username})`
+				}
+			} else if (forward.fromChat) {
+				forwardContext += ` from ${forward.fromChat.title || 'unknown chat'}`
+				if (forward.fromChat.type) {
+					forwardContext += ` (${forward.fromChat.type})`
+				}
+			}
+			forwardContext += ']'
+			prompt = `${forwardContext}\n${prompt}`
+		}
+		if (attachments?.length) {
+			const notes: string[] = []
+			for (const attachment of attachments) {
+				if (!attachment.localPath) continue
+				switch (attachment.type) {
+					case 'photo':
+						notes.push(`[Image: ${attachment.localPath}]`)
+						break
+					case 'document':
+						notes.push(`[File: ${attachment.localPath}]`)
+						break
+					case 'audio':
+						notes.push(`[Audio: ${attachment.localPath}]`)
+						break
+					case 'voice':
+						notes.push(`[Voice: ${attachment.localPath}]`)
+						break
+				}
+			}
+			if (notes.length) {
+				const attachmentNote = notes.join(' ')
+				prompt = prompt ? `${attachmentNote}\n\n${prompt}` : attachmentNote
+			}
+		}
+
+		// Remember the chat for cron delivery
+		if (!primaryChatId) {
+			primaryChatId = chatId
+		}
+
+		log(`[jsonl-bridge] Received from ${chatId}: "${prompt.slice(0, 50)}..."`)
+
+		// Handle commands (always process immediately)
+		const cmdResult = await parseCommand({
+			text: prompt,
+			chatId,
+			manifests,
+			defaultCli: config.defaultCli,
+			sessionStore,
+			workingDirectory: config.workingDirectory,
+			cronService,
+			persistentStore,
+		})
+		if (cmdResult.handled) {
+			if ('async' in cmdResult && cmdResult.response === '__SPAWN__') {
+				const spawnCmd = parseSpawnCommand(prompt)
+				if (spawnCmd) {
+					// Inherit parent's CLI unless explicitly overridden
+					const activeCli = persistentStore.getActiveCli(chatId) || sessionStore.getActiveCli(chatId) || config.defaultCli
+					const settings = persistentStore.getChatSettings(chatId)
+					void spawnSubagent({
+						chatId,
+						task: spawnCmd.task,
+						label: spawnCmd.label,
+						cli: spawnCmd.cli || activeCli,
+						explicitCli: Boolean(spawnCmd.cli),
+						manifests,
+						defaultCli: config.defaultCli,
+						subagentFallbackCli: config.subagentFallbackCli,
+						workingDirectory: config.workingDirectory,
+						memory: config.memory,
+						model: settings.model,
+						envFile: config.envFile,
+						send,
+						logMessage: persistentStore.logMessage,
+					})
+					return
+				}
+			}
+			
+			// Handle /interrupt or /skip - send response then flush queue
+			if ('async' in cmdResult && cmdResult.response.startsWith('__INTERRUPT__:')) {
+				const userMessage = cmdResult.response.slice('__INTERRUPT__:'.length)
+				log(`[jsonl-bridge] Task interrupted: ${text}`)
+				await send(chatId, userMessage)
+				// Flush the queue to process next message
+				void flushQueue(chatId)
+				return
+			}
+			
+			log(`[jsonl-bridge] Command handled: ${text}`)
+			await send(chatId, cmdResult.response)
+			return
+		}
+
+		// Check for natural language spawn requests (e.g., "spawn a subagent to...")
+		const naturalSpawn = parseNaturalSpawnRequest(prompt)
+		if (naturalSpawn) {
+			log(`[jsonl-bridge] Natural language spawn detected: "${naturalSpawn.task.slice(0, 50)}..."`)
+			const activeCli = persistentStore.getActiveCli(chatId) || sessionStore.getActiveCli(chatId) || config.defaultCli
+			const settings = persistentStore.getChatSettings(chatId)
+			void spawnSubagent({
+				chatId,
+				task: naturalSpawn.task,
+				label: naturalSpawn.label,
+				cli: naturalSpawn.cli || activeCli,
+				explicitCli: Boolean(naturalSpawn.cli),
+				manifests,
+				defaultCli: config.defaultCli,
+				subagentFallbackCli: config.subagentFallbackCli,
+				workingDirectory: config.workingDirectory,
+				memory: config.memory,
+				model: settings.model,
+				envFile: config.envFile,
+				send,
+				logMessage: persistentStore.logMessage,
+			})
+			return
+		}
+
+		// Check if busy - queue message if so
+		if (sessionStore.isBusy(chatId)) {
+			const queueLen = sessionStore.getQueueLength(chatId)
+			if (queueLen >= 5) {
+				await send(chatId, '⚠️ Queue full (5 messages). Wait for current task or /stop.')
+				return
+			}
+			sessionStore.enqueue(chatId, {
+				id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+				text: prompt,
+				attachments: attachments?.map(a => ({ localPath: a.localPath })),
+				createdAt: Date.now(),
+				context,
+			})
+			await send(chatId, `📥 Queued (${queueLen + 1} pending). Will process after current task.`)
+			return
+		}
+
+		await processMessage(chatId, prompt, context)
+	}
+
+	ws.on('message', (data) => {
+		try {
+			const event = JSON.parse(data.toString()) as GatewayEvent
+			if (event.type === 'message.received') {
+				void handleMessage(event.payload)
+			}
+		} catch {
+			// ignore
+		}
+	})
+
+	ws.on('error', (err) => {
+		logError('[jsonl-bridge] WebSocket error:', err.message)
+	})
+
+	ws.on('close', () => {
+		log('[jsonl-bridge] Disconnected from gateway')
+	})
+
+	ws.on('open', () => {
+		log('[jsonl-bridge] Connected to gateway')
+	})
+
+	const DEFAULT_STEP_MAX_CHARS = 8000
+
+	type CronStepPlan = {
+		preamble?: string
+		expectations: CronOutputExpectation[]
+		errors: string[]
+	}
+
+	const truncateStepContent = (text: string, maxChars: number): string => {
+		if (text.length <= maxChars) return text
+		const clipped = text.slice(0, maxChars)
+		return `${clipped}\n...[truncated ${text.length - maxChars} chars]...`
+	}
+
+	const formatReadFileEntry = (id: string, path: string, content: string): string => {
+		return [`### ${id} (read_file ${path})`, '```', content, '```'].join('\n')
+	}
+
+	const buildCronStepPlan = async (job: CronJob, workingDirectory: string): Promise<CronStepPlan> => {
+		if (!job.steps?.length) return { expectations: [], errors: [] }
+		const sections: string[] = []
+		const expectations: CronOutputExpectation[] = []
+		const errors: string[] = []
+		for (const step of job.steps) {
+			switch (step.action) {
+				case 'read_file': {
+					const maxChars = step.maxChars ?? DEFAULT_STEP_MAX_CHARS
+					const resolvedPath = isAbsolute(step.path) ? step.path : join(workingDirectory, step.path)
+					try {
+						const raw = await readFile(resolvedPath, 'utf-8')
+						const content = truncateStepContent(raw.trimEnd(), maxChars)
+						sections.push(formatReadFileEntry(step.id, resolvedPath, content))
+					} catch (err) {
+						const message = `step ${step.id} failed to read ${resolvedPath}: ${String(err)}`
+						sections.push(`### ${step.id} (read_file ${resolvedPath})\nERROR: ${message}`)
+						if (step.required ?? true) errors.push(message)
+					}
+					break
+				}
+				case 'expect_output':
+					expectations.push({
+						id: step.id,
+						pattern: step.pattern,
+						flags: step.flags,
+						description: step.description,
+					})
+					break
+			}
+		}
+		const preamble = sections.length
+			? ['CRON STEP RESULTS (read-only):', ...sections].join('\n\n')
+			: undefined
+		return { preamble, expectations, errors }
+	}
+
+	const validateCronExpectations = (
+		text: string,
+		expectations?: CronOutputExpectation[]
+	): string | undefined => {
+		if (!expectations?.length) return undefined
+		if (!text) return `missing output for ${expectations[0].description ?? expectations[0].id}`
+		for (const expectation of expectations) {
+			let matcher: RegExp
+			try {
+				matcher = new RegExp(expectation.pattern, expectation.flags)
+			} catch (err) {
+				return `invalid expectation pattern for ${expectation.id}: ${String(err)}`
+			}
+			if (!matcher.test(text)) {
+				return `missing expected output for ${expectation.description ?? expectation.id}`
+			}
+		}
+		return undefined
+	}
+
+	const parseCronExpectations = (raw: unknown): CronOutputExpectation[] | undefined => {
+		if (!Array.isArray(raw)) return undefined
+		const expectations: CronOutputExpectation[] = []
+		for (const item of raw) {
+			if (!item || typeof item !== 'object') continue
+			const record = item as Record<string, unknown>
+			if (typeof record.id !== 'string' || typeof record.pattern !== 'string') continue
+			expectations.push({
+				id: record.id,
+				pattern: record.pattern,
+				flags: typeof record.flags === 'string' ? record.flags : undefined,
+				description: typeof record.description === 'string' ? record.description : undefined,
+			})
+		}
+		return expectations.length ? expectations : undefined
+	}
+
+	const runCronJobMain = async (job: CronJob): Promise<void> => {
+		if (!primaryChatId) {
+			log('[jsonl-bridge] Cron job due but no primary chat set')
+			return
+		}
+		const targetChatId = primaryChatId
+		const stepPlan = await buildCronStepPlan(job, config.workingDirectory)
+		if (stepPlan.errors.length) {
+			const errorMessage = stepPlan.errors.join('; ')
+			cronService.markComplete(job.id, errorMessage)
+			await send(targetChatId, `❌ Cron failed: ${job.name}\n${errorMessage}`)
+			return
+		}
+		const prompt = stepPlan.preamble ? `${stepPlan.preamble}\n\n${job.message}` : job.message
+		log(`[jsonl-bridge] Cron job triggered: ${job.name}`)
+		await send(targetChatId, `⏰ Cron: ${job.name}`)
+		void handleMessage({
+			id: `cron-${Date.now()}`,
+			chatId: targetChatId,
+			text: prompt,
+			userId: 'cron',
+			messageId: 0,
+			timestamp: new Date().toISOString(),
+			raw: {
+				cron: true,
+				jobId: job.id,
+				cronExpectations: stepPlan.expectations.length ? stepPlan.expectations : undefined,
+			},
+		})
+	}
+
+	const runCronJobIsolated = async (job: CronJob): Promise<void> => {
+		if (!primaryChatId) {
+			log('[jsonl-bridge] Cron isolated job due but no primary chat set')
+			return
+		}
+		const targetChatId = primaryChatId
+		const stepPlan = await buildCronStepPlan(job, config.workingDirectory)
+		if (stepPlan.errors.length) {
+			const errorMessage = stepPlan.errors.join('; ')
+			await cronService.markIsolatedComplete(job.id, undefined, errorMessage)
+			await send(targetChatId, `❌ Cron (isolated) failed: ${job.name}\n${errorMessage}`)
+			return
+		}
+
+		const manifest = manifests.get(config.defaultCli)
+		if (!manifest) {
+			await cronService.markIsolatedComplete(job.id, undefined, `CLI '${config.defaultCli}' not found`)
+			await send(targetChatId, `❌ Cron (isolated) failed: CLI '${config.defaultCli}' not found`)
+			return
+		}
+
+		await send(targetChatId, `⏰ Cron (isolated): ${job.name}`)
+
+		void enqueueCommandInLane(CommandLane.Cron, async () => {
+			const session = new JsonlSession(`cron-${job.id}-${Date.now()}`, manifest, config.workingDirectory, { envFile: config.envFile })
+			let lastText = ''
+			let completed = false
+			const modelOverride = job.model ?? persistentStore.getChatSettings(targetChatId).model
+
+			const finish = async (summary?: string, error?: string) => {
+				if (completed) return
+				completed = true
+				const expectationError = error
+					? error
+					: validateCronExpectations(summary ?? '', stepPlan.expectations)
+				await cronService.markIsolatedComplete(job.id, expectationError ? undefined : summary, expectationError)
+				if (expectationError) {
+					await send(targetChatId, `❌ Cron (isolated) failed: ${job.name}\n${expectationError}`)
+				} else if (summary) {
+					await send(targetChatId, `✅ Cron (isolated) complete: ${job.name}\n\n${summary}`)
+				} else {
+					await send(targetChatId, `✅ Cron (isolated) complete: ${job.name}`)
+				}
+			}
+
+			return new Promise<void>((resolve) => {
+				session.on('event', (evt: BridgeEvent) => {
+					switch (evt.type) {
+						case 'text':
+							if (evt.text) lastText = evt.text
+							break
+						case 'completed': {
+							const summary = evt.answer || lastText
+							void finish(summary, evt.isError ? summary || 'error' : undefined).then(resolve)
+							break
+						}
+						case 'error':
+							void finish(undefined, evt.message).then(resolve)
+							break
+					}
+				})
+
+				session.on('exit', (code) => {
+					if (!completed) {
+						void finish(undefined, `Process exited with code ${code}`).then(resolve)
+					}
+				})
+
+			const prompt = stepPlan.preamble ? `${stepPlan.preamble}\n\n${job.message}` : job.message
+			session.run(prompt, undefined, { model: resolveModelForCli(config.defaultCli, modelOverride) })
+			})
+		})
+	}
+
+	const triggerHeartbeat = async (): Promise<void> => {
+		const pending = cronService.flushPendingHeartbeat()
+		for (const job of pending) {
+			await runCronJobMain(job)
+		}
+	}
+
+	// Handle cron job triggers
+	cronService.on('event', async (evt) => {
+		if (evt.type === 'job:due') {
+			await runCronJobMain(evt.job)
+			return
+		}
+		if (evt.type === 'job:isolated') {
+			await runCronJobIsolated(evt.job)
+		}
+	})
+
+	return {
+		close: () => {
+			cronService.stop()
+			ws.close()
+			for (const session of sessionStore.sessions.values()) {
+				session.terminate()
+			}
+		},
+		getManifests: () => manifests,
+		getSessionStore: () => sessionStore,
+	}
+}
+
+const splitMessage = (text: string, maxLength = 4000): string[] => {
+	if (text.length <= maxLength) return [text]
+
+	const chunks: string[] = []
+	let remaining = text
+
+	while (remaining.length > 0) {
+		if (remaining.length <= maxLength) {
+			chunks.push(remaining)
+			break
+		}
+
+		let splitAt = remaining.lastIndexOf('\n', maxLength)
+		if (splitAt === -1 || splitAt < maxLength / 2) {
+			splitAt = maxLength
+		}
+
+		chunks.push(remaining.slice(0, splitAt))
+		remaining = remaining.slice(splitAt).trimStart()
+	}
+
+	return chunks
+}
