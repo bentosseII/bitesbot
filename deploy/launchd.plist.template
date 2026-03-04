@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LAUNCHD_LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PROJECT_ROOT}}/deploy/launchd-run.sh</string>
+        <string>start</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_ROOT}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/logs/bitesbot.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/logs/bitesbot.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>TG_GATEWAY_CONFIG</key>
+        <string>{{HOME}}/.config/tg-gateway/config.json</string>
+        <key>TG_GATEWAY_LAUNCHD_LABEL</key>
+        <string>{{LAUNCHD_LABEL}}</string>
+        <key>TG_GATEWAY_LAUNCHD_PLIST</key>
+        <string>{{HOME}}/Library/LaunchAgents/{{LAUNCHD_LABEL}}.plist</string>
+    </dict>
+</dict>
+</plist>
