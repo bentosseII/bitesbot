@@ -1,0 +1,13 @@
+name: droid
+command: ~/.local/bin/droid
+args:
+  - --skip-permissions-unsafe
+inputMode: jsonl
+
+resume:
+  flag: --session-id
+  sessionArg: last
+
+model:
+  flag: --model
+  default: claude-opus-4-5-20251101
