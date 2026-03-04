@@ -1,0 +1,2 @@
+pnpm run docs:check
+pnpm exec vitest run --config vitest.e2e.config.ts tests/telegram-contract.e2e.ts
